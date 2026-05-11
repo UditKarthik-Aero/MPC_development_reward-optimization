@@ -1,0 +1,850 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+import copy
+
+# =========================================================
+# 1. PHYSICAL CONSTANTS
+# =========================================================
+G = 9.80665
+
+F_MAX = 2_500_000.0
+MIN_THROTTLE = 0.10
+
+DRY_MASS = 35600.0
+FUEL_MASS = 40000.0
+
+ISP_VAC = 380.0
+ISP_SEA = 330.0
+
+HEIGHT = 50.0
+RADIUS = 1.8
+
+AREA_SIDE = HEIGHT * RADIUS * 2
+AREA_FINS = 6.0
+
+# =========================================================
+# 2. ENVIRONMENT
+# =========================================================
+WIND_GUST_STRENGTH = 15.0
+SENSOR_NOISE_STD = 0.5
+
+# =========================================================
+# 3. RL / POLICY SEARCH CONFIGURATION
+# =========================================================
+NUM_GENERATIONS = 30
+POLICIES_PER_GENERATION = 8
+TRIALS_PER_POLICY = 10
+
+SAFE_SPEED = 6.0
+SAFE_OFFSET = 20.0
+SAFE_TILT = 20.0
+
+EXPLORATION_STD = 0.08
+
+# =========================================================
+# 4. INERTIA MODEL
+# =========================================================
+def get_inertia(mass):
+
+    return (
+        (1 / 12)
+        * mass
+        * (3 * RADIUS**2 + HEIGHT**2)
+    )
+
+# =========================================================
+# 5. POLICY / CONTROLLER
+# =========================================================
+class RLPolicyMPC:
+
+    def __init__(self):
+
+        # -------------------------------------------------
+        # TRANSLATIONAL CONTROL
+        # -------------------------------------------------
+        self.kp_xy = 0.80
+        self.kd_xy = 2.00
+        self.kz = 6.00
+
+        # -------------------------------------------------
+        # ATTITUDE CONTROL
+        # -------------------------------------------------
+        self.kp_att = 850000.0
+        self.kd_att = 350000.0
+
+        # -------------------------------------------------
+        # GUIDANCE PARAMETERS
+        # -------------------------------------------------
+        self.max_tilt_deg = 35.0
+        self.ignition_buffer = 300.0
+
+        # -------------------------------------------------
+        # INTERNAL STATE
+        # -------------------------------------------------
+        self.ignited = False
+
+    # =====================================================
+    # CREATE MUTATED POLICY
+    # =====================================================
+    def mutate(self):
+
+        child = copy.deepcopy(self)
+
+        child.kp_xy *= (
+            1 + np.random.normal(0, EXPLORATION_STD)
+        )
+
+        child.kd_xy *= (
+            1 + np.random.normal(0, EXPLORATION_STD)
+        )
+
+        child.kz *= (
+            1 + np.random.normal(0, EXPLORATION_STD)
+        )
+
+        child.kd_att *= (
+            1 + np.random.normal(0, EXPLORATION_STD)
+        )
+
+        child.max_tilt_deg *= (
+            1 + np.random.normal(0, 0.03)
+        )
+
+        child.ignition_buffer *= (
+            1 + np.random.normal(0, 0.05)
+        )
+
+        # -------------------------------------------------
+        # SAFETY LIMITS
+        # -------------------------------------------------
+        child.kp_xy = np.clip(
+            child.kp_xy,
+            0.2,
+            5.0
+        )
+
+        child.kd_xy = np.clip(
+            child.kd_xy,
+            0.5,
+            8.0
+        )
+
+        child.kz = np.clip(
+            child.kz,
+            2.0,
+            15.0
+        )
+
+        child.kd_att = np.clip(
+            child.kd_att,
+            100000,
+            1500000
+        )
+
+        child.max_tilt_deg = np.clip(
+            child.max_tilt_deg,
+            10.0,
+            45.0
+        )
+
+        child.ignition_buffer = np.clip(
+            child.ignition_buffer,
+            100.0,
+            600.0
+        )
+
+        return child
+
+    # =====================================================
+    # GUIDANCE LAW
+    # =====================================================
+    def get_commands(self, noisy_pos, noisy_vel, mass):
+
+        x, y, z = noisy_pos
+        vx, vy, vz = noisy_vel
+
+        max_a_z = (F_MAX / mass) - G
+
+        d_brake = (
+            vz**2 /
+            (2 * max_a_z * 0.75)
+        )
+
+        # -------------------------------------------------
+        # IGNITION LOGIC
+        # -------------------------------------------------
+        if not self.ignited:
+
+            if z <= d_brake + self.ignition_buffer:
+                self.ignited = True
+
+            return (
+                0.0,
+                -noisy_vel /
+                (np.linalg.norm(noisy_vel) + 1e-6)
+            )
+
+        # -------------------------------------------------
+        # DESCENT PROFILE
+        # -------------------------------------------------
+        if z > 1000:
+            v_z_target = -60.0
+
+        elif z > 200:
+            v_z_target = -25.0
+
+        elif z > 50:
+            v_z_target = -5.0
+
+        else:
+            v_z_target = -0.3
+
+        # -------------------------------------------------
+        # REQUIRED ACCELERATION
+        # -------------------------------------------------
+        az_req = (
+            self.kz *
+            (v_z_target - vz)
+            + G
+        )
+
+        ax_req = (
+            -self.kp_xy * x
+            -self.kd_xy * vx
+        )
+
+        ay_req = (
+            -self.kp_xy * y
+            -self.kd_xy * vy
+        )
+
+        total_f_req = np.array([
+            ax_req,
+            ay_req,
+            az_req
+        ]) * mass
+
+        # -------------------------------------------------
+        # TILT LIMITING
+        # -------------------------------------------------
+        max_tilt = np.radians(
+            self.max_tilt_deg
+            if z > 50
+            else 5.0
+        )
+
+        f_mag = np.linalg.norm(total_f_req)
+
+        f_dir = (
+            total_f_req /
+            (f_mag + 1e-6)
+        )
+
+        tilt = np.arccos(
+            np.clip(f_dir[2], -1, 1)
+        )
+
+        if tilt > max_tilt:
+
+            scale = (
+                np.tan(max_tilt)
+                * total_f_req[2]
+                / (
+                    np.linalg.norm(total_f_req[:2])
+                    + 1e-6
+                )
+            )
+
+            total_f_req[:2] *= scale
+
+        # -------------------------------------------------
+        # FINAL THRUST
+        # -------------------------------------------------
+        thrust_mag = np.clip(
+            np.linalg.norm(total_f_req),
+            F_MAX * MIN_THROTTLE,
+            F_MAX
+        )
+
+        thrust_dir = (
+            total_f_req /
+            (np.linalg.norm(total_f_req) + 1e-6)
+        )
+
+        return thrust_mag, thrust_dir
+
+# =========================================================
+# 6. SINGLE MONTE CARLO SIMULATION
+# =========================================================
+def run_single_sim(policy):
+
+    # -----------------------------------------------------
+    # RANDOMIZED INITIAL CONDITIONS
+    # -----------------------------------------------------
+    pos = np.array([
+
+        np.random.normal(500.0, 40.0),
+
+        np.random.normal(-300.0, 40.0),
+
+        np.random.normal(5000.0, 50.0)
+    ])
+
+    vel = np.array([
+
+        np.random.normal(-40.0, 6.0),
+
+        np.random.normal(20.0, 6.0),
+
+        np.random.normal(-150.0, 8.0)
+    ])
+
+    rocket_axis = np.array([
+        0.0,
+        0.0,
+        1.0
+    ])
+
+    omega = np.zeros(3)
+
+    mass = DRY_MASS + FUEL_MASS
+
+    dt = 0.02
+
+    policy.ignited = False
+
+    history = []
+
+    final_tilt = 0
+
+    # =====================================================
+    # MAIN SIMULATION LOOP
+    # =====================================================
+    for i in range(50000):
+
+        if pos[2] <= 0:
+            break
+
+        # -------------------------------------------------
+        # SENSOR NOISE
+        # -------------------------------------------------
+        noisy_pos = (
+            pos +
+            np.random.normal(
+                0,
+                SENSOR_NOISE_STD,
+                3
+            )
+        )
+
+        noisy_vel = (
+            vel +
+            np.random.normal(
+                0,
+                SENSOR_NOISE_STD / 2,
+                3
+            )
+        )
+
+        # -------------------------------------------------
+        # WIND MODEL
+        # -------------------------------------------------
+        wind_vec = np.array([
+
+            np.sin(
+                i * 0.01 +
+                np.random.uniform(-1, 1)
+            )
+            * WIND_GUST_STRENGTH
+            * np.random.uniform(0.5, 1.5),
+
+            np.cos(
+                i * 0.012 +
+                np.random.uniform(-1, 1)
+            )
+            * WIND_GUST_STRENGTH
+            * np.random.uniform(0.5, 1.5),
+
+            0
+        ])
+
+        relative_vel = vel - wind_vec
+
+        # -------------------------------------------------
+        # GUIDANCE COMMANDS
+        # -------------------------------------------------
+        T_mag, T_dir_target = policy.get_commands(
+            noisy_pos,
+            noisy_vel,
+            mass
+        )
+
+        # -------------------------------------------------
+        # ATMOSPHERE
+        # -------------------------------------------------
+        rho = (
+            1.225 *
+            np.exp(-max(0, pos[2]) / 8500.0)
+        )
+
+        q = (
+            0.5
+            * rho
+            * np.linalg.norm(relative_vel)**2
+        )
+
+        inertia = get_inertia(mass)
+
+        # =================================================
+        # ATTITUDE CONTROL
+        # =================================================
+        attitude_error = np.cross(
+            rocket_axis,
+            T_dir_target
+        )
+
+        control_torque = (
+
+            policy.kp_att
+            * attitude_error
+
+            - policy.kd_att
+            * omega
+        )
+
+        aero_torque = (
+
+            np.cross(
+                rocket_axis,
+                -relative_vel /
+                (np.linalg.norm(relative_vel) + 1e-6)
+            )
+
+            * q
+            * AREA_FINS
+            * (HEIGHT / 2)
+            * 0.15
+        )
+
+        total_torque = (
+            control_torque +
+            aero_torque
+        )
+
+        alpha = total_torque / inertia
+
+        omega += alpha * dt
+
+        MAX_OMEGA = np.radians(25)
+
+        omega_mag = np.linalg.norm(omega)
+
+        if omega_mag > MAX_OMEGA:
+
+            omega = (
+                omega /
+                omega_mag *
+                MAX_OMEGA
+            )
+
+        omega *= 0.90
+
+        rocket_axis += (
+            np.cross(omega, rocket_axis) * dt
+        )
+
+        norm = np.linalg.norm(rocket_axis)
+
+        if norm > 1e-6:
+            rocket_axis /= norm
+
+        # -------------------------------------------------
+        # TILT
+        # -------------------------------------------------
+        final_tilt = np.degrees(
+            np.arccos(
+                np.clip(
+                    rocket_axis[2],
+                    -1,
+                    1
+                )
+            )
+        )
+
+        # -------------------------------------------------
+        # EMERGENCY STABILIZATION
+        # -------------------------------------------------
+        if final_tilt > 25:
+            T_mag *= 0.7
+
+        # -------------------------------------------------
+        # FORCES
+        # -------------------------------------------------
+        thrust_vec = rocket_axis * T_mag
+
+        drag_vec = (
+
+            -relative_vel
+
+            * (
+                0.5
+                * rho
+                * np.linalg.norm(relative_vel)
+                * AREA_SIDE
+                * 0.4
+            )
+        )
+
+        accel = (
+
+            thrust_vec
+            + drag_vec
+            + np.array([0, 0, -G * mass])
+
+        ) / mass
+
+        # -------------------------------------------------
+        # TRANSLATIONAL DYNAMICS
+        # -------------------------------------------------
+        vel += accel * dt
+
+        pos += vel * dt
+
+        # -------------------------------------------------
+        # FUEL
+        # -------------------------------------------------
+        isp = (
+
+            ISP_VAC
+
+            - (
+                ISP_VAC - ISP_SEA
+            )
+
+            * np.exp(-pos[2] / 8500.0)
+        )
+
+        mass -= (
+            T_mag / (isp * G)
+        ) * dt
+
+        if mass <= DRY_MASS:
+            mass = DRY_MASS
+
+        history.append(pos.copy())
+
+    # =====================================================
+    # FINAL METRICS
+    # =====================================================
+    final_speed = np.linalg.norm(vel)
+
+    landing_offset = np.linalg.norm(pos[:2])
+
+    fuel_used = (
+        DRY_MASS + FUEL_MASS - mass
+    )
+
+    # =====================================================
+    # REWARD FUNCTION
+    # =====================================================
+    reward = -(
+        0.5 * final_speed**2
+        + 0.03 * landing_offset**2
+        + 0.1 * final_tilt**2
+        + 0.00001 * fuel_used**2
+    )
+
+    success = (
+        final_speed <= SAFE_SPEED
+        and landing_offset <= SAFE_OFFSET
+        and final_tilt <= SAFE_TILT
+    )
+
+    return {
+
+        "reward": reward,
+
+        "speed": final_speed,
+
+        "offset": landing_offset,
+
+        "tilt": final_tilt,
+
+        "fuel": fuel_used,
+
+        "success": success,
+
+        "history": np.array(history)
+    }
+
+# =========================================================
+# 7. INITIAL BASE POLICY
+# =========================================================
+base_policy = RLPolicyMPC()
+
+# =========================================================
+# 8. GLOBAL BEST POLICY
+# =========================================================
+best_policy = copy.deepcopy(base_policy)
+
+best_reward = -np.inf
+
+reward_history = []
+
+best_run = None
+
+# =========================================================
+# 9. GENERATIONAL RL LOOP
+# =========================================================
+for generation in range(NUM_GENERATIONS):
+
+    print("\n" + "#" * 80)
+    print(f"GENERATION {generation+1:02d}")
+    print("#" * 80)
+
+    generation_best_reward = -np.inf
+    generation_best_policy = None
+
+    # -----------------------------------------------------
+    # POLICY SEARCH
+    # -----------------------------------------------------
+    for policy_index in range(POLICIES_PER_GENERATION):
+
+        # Create candidate policy
+        candidate = best_policy.mutate()
+
+        rewards = []
+
+        successes = 0
+
+        best_local_run = None
+
+        best_local_reward = -np.inf
+
+        # =================================================
+        # MONTE CARLO EVALUATION
+        # =================================================
+        for trial in range(TRIALS_PER_POLICY):
+
+            result = run_single_sim(candidate)
+
+            rewards.append(result["reward"])
+
+            if result["success"]:
+                successes += 1
+
+            if result["reward"] > best_local_reward:
+
+                best_local_reward = result["reward"]
+
+                best_local_run = result
+
+        # -------------------------------------------------
+        # POLICY PERFORMANCE
+        # -------------------------------------------------
+        mean_reward = np.mean(rewards)
+
+        success_rate = (
+            successes / TRIALS_PER_POLICY
+        ) * 100
+
+        print(
+            f"\nPolicy {policy_index+1:02d}"
+        )
+
+        print(
+            f"Mean Reward : {mean_reward:.2f}"
+        )
+
+        print(
+            f"Success Rate: {success_rate:.2f}%"
+        )
+
+        print(
+            f"kp_xy       : {candidate.kp_xy:.3f}"
+        )
+
+        print(
+            f"kd_xy       : {candidate.kd_xy:.3f}"
+        )
+
+        print(
+            f"kz          : {candidate.kz:.3f}"
+        )
+
+        print(
+            f"kd_att      : {candidate.kd_att:.0f}"
+        )
+
+        print(
+            f"max_tilt    : "
+            f"{candidate.max_tilt_deg:.2f}"
+        )
+
+        # -------------------------------------------------
+        # KEEP BEST POLICY OF GENERATION
+        # -------------------------------------------------
+        if mean_reward > generation_best_reward:
+
+            generation_best_reward = mean_reward
+
+            generation_best_policy = copy.deepcopy(
+                candidate
+            )
+
+            best_generation_run = best_local_run
+
+    # =====================================================
+    # GENERATION COMPLETE
+    # =====================================================
+    reward_history.append(
+        generation_best_reward
+    )
+
+    print("\n" + "=" * 80)
+
+    print(
+        f"GENERATION {generation+1:02d} BEST REWARD: "
+        f"{generation_best_reward:.2f}"
+    )
+
+    # -----------------------------------------------------
+    # GLOBAL POLICY UPDATE
+    # -----------------------------------------------------
+    if generation_best_reward > best_reward:
+
+        best_reward = generation_best_reward
+
+        best_policy = copy.deepcopy(
+            generation_best_policy
+        )
+
+        best_run = best_generation_run
+
+        print(
+            "NEW GLOBAL BEST POLICY FOUND"
+        )
+
+    else:
+
+        print(
+            "NO GLOBAL IMPROVEMENT"
+        )
+
+# =========================================================
+# 10. FINAL RESULTS
+# =========================================================
+print("\n" + "#" * 80)
+print("FINAL RL OPTIMIZATION RESULTS")
+print("#" * 80)
+
+print(
+    f"Best Reward Achieved: "
+    f"{best_reward:.2f}"
+)
+
+print("\nBEST POLICY PARAMETERS:")
+
+print(
+    f"kp_xy           = "
+    f"{best_policy.kp_xy:.3f}"
+)
+
+print(
+    f"kd_xy           = "
+    f"{best_policy.kd_xy:.3f}"
+)
+
+print(
+    f"kz              = "
+    f"{best_policy.kz:.3f}"
+)
+
+print(
+    f"kd_att          = "
+    f"{best_policy.kd_att:.0f}"
+)
+
+print(
+    f"max_tilt_deg    = "
+    f"{best_policy.max_tilt_deg:.2f}"
+)
+
+print(
+    f"ignition_buffer = "
+    f"{best_policy.ignition_buffer:.2f}"
+)
+
+# =========================================================
+# 11. BEST TRAJECTORY
+# =========================================================
+history = best_run["history"]
+
+fig = plt.figure(figsize=(10, 8))
+
+ax = fig.add_subplot(
+    111,
+    projection='3d'
+)
+
+hx = history[:, 0]
+hy = history[:, 1]
+hz = history[:, 2]
+
+ax.plot(
+    hx,
+    hy,
+    hz,
+    lw=2,
+    label='Best RL Trajectory'
+)
+
+ax.scatter(
+    hx[0],
+    hy[0],
+    hz[0],
+    s=100,
+    label='Start'
+)
+
+ax.scatter(
+    hx[-1],
+    hy[-1],
+    hz[-1],
+    s=100,
+    label='Landing'
+)
+
+ax.set_xlabel('X Position (m)')
+ax.set_ylabel('Y Position (m)')
+ax.set_zlabel('Altitude (m)')
+
+ax.set_title(
+    'Hybrid RL-MPC Powered Descent'
+)
+
+ax.legend()
+
+plt.show()
+
+# =========================================================
+# 12. REWARD EVOLUTION
+# =========================================================
+plt.figure(figsize=(8, 5))
+
+plt.plot(
+    reward_history,
+    marker='o'
+)
+
+plt.xlabel("Generation")
+plt.ylabel("Best Reward")
+
+plt.title(
+    "Reinforcement Learning Progress"
+)
+
+plt.grid(True)
+
+plt.show()
