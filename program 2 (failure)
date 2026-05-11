@@ -1,0 +1,941 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import copy
+
+# =========================================================
+# 1. CONSTANTS
+# =========================================================
+G = 9.80665
+
+F_MAX = 2_500_000.0
+MIN_THROTTLE = 0.10
+
+DRY_MASS = 35600.0
+FUEL_MASS = 40000.0
+
+ISP_VAC = 380.0
+ISP_SEA = 330.0
+
+HEIGHT = 50.0
+RADIUS = 1.8
+
+AREA_SIDE = HEIGHT * RADIUS * 2
+AREA_FINS = 6.0
+
+# =========================================================
+# 2. ENVIRONMENT
+# =========================================================
+WIND_GUST_STRENGTH = 15.0
+SENSOR_NOISE_STD = 0.5
+
+# =========================================================
+# 3. RL CONFIGURATION
+# =========================================================
+NUM_GENERATIONS = 25
+
+POLICIES_PER_GENERATION = 12
+
+TRIALS_PER_POLICY = 8
+
+ELITE_COUNT = 3
+
+EXPLORATION_STD = 0.06
+
+# =========================================================
+# 4. SUCCESS LIMITS
+# =========================================================
+SAFE_SPEED = 5.0
+SAFE_OFFSET = 10.0
+SAFE_TILT = 15.0
+
+# =========================================================
+# 5. INERTIA
+# =========================================================
+def get_inertia(mass):
+
+    return (
+        (1 / 12)
+        * mass
+        * (3 * RADIUS**2 + HEIGHT**2)
+    )
+
+# =========================================================
+# 6. PREDICTIVE UTILITIES
+# =========================================================
+def estimate_time_to_impact(z, vz):
+
+    vz = min(vz, -0.1)
+
+    return max(0.1, abs(z / vz))
+
+def estimate_impact_point(pos, vel):
+
+    x, y, z = pos
+    vx, vy, vz = vel
+
+    t_impact = estimate_time_to_impact(z, vz)
+
+    impact_x = x + vx * t_impact
+    impact_y = y + vy * t_impact
+
+    return np.array([impact_x, impact_y])
+
+def lateral_energy(mass, vx, vy):
+
+    return 0.5 * mass * (vx**2 + vy**2)
+
+# =========================================================
+# 7. HIERARCHICAL RL POLICY
+# =========================================================
+class HierarchicalRLPolicy:
+
+    def __init__(self):
+
+        # -------------------------------------------------
+        # LOW LEVEL MPC
+        # -------------------------------------------------
+        self.kp_xy = 0.7
+        self.kd_xy = 1.8
+        self.kz = 6.0
+
+        self.kp_att = 1_100_000.0
+        self.kd_att = 550_000.0
+
+        # -------------------------------------------------
+        # RL STRATEGIC PARAMETERS
+        # -------------------------------------------------
+        self.descent_aggression = 1.0
+
+        self.wind_compensation = 1.0
+
+        self.prediction_strength = 1.0
+
+        self.lateral_bias_strength = 1.0
+
+        self.max_tilt_deg = 25.0
+
+        self.ignition_buffer = 280.0
+
+        self.ignited = False
+
+    # =====================================================
+    # MUTATION
+    # =====================================================
+    def mutate(self):
+
+        child = copy.deepcopy(self)
+
+        params = [
+
+            "kp_xy",
+            "kd_xy",
+            "kz",
+            "kp_att",
+            "kd_att",
+            "descent_aggression",
+            "wind_compensation",
+            "prediction_strength",
+            "lateral_bias_strength",
+            "max_tilt_deg",
+            "ignition_buffer"
+        ]
+
+        for p in params:
+
+            val = getattr(child, p)
+
+            val *= (
+                1 + np.random.normal(
+                    0,
+                    EXPLORATION_STD
+                )
+            )
+
+            setattr(child, p, val)
+
+        # -------------------------------------------------
+        # LIMITS
+        # -------------------------------------------------
+        child.kp_xy = np.clip(child.kp_xy, 0.2, 4.0)
+        child.kd_xy = np.clip(child.kd_xy, 0.5, 6.0)
+        child.kz = np.clip(child.kz, 2.0, 12.0)
+
+        child.kp_att = np.clip(
+            child.kp_att,
+            300000,
+            3000000
+        )
+
+        child.kd_att = np.clip(
+            child.kd_att,
+            100000,
+            2000000
+        )
+
+        child.descent_aggression = np.clip(
+            child.descent_aggression,
+            0.5,
+            2.0
+        )
+
+        child.wind_compensation = np.clip(
+            child.wind_compensation,
+            0.5,
+            2.5
+        )
+
+        child.prediction_strength = np.clip(
+            child.prediction_strength,
+            0.1,
+            3.0
+        )
+
+        child.lateral_bias_strength = np.clip(
+            child.lateral_bias_strength,
+            0.2,
+            3.0
+        )
+
+        child.max_tilt_deg = np.clip(
+            child.max_tilt_deg,
+            5.0,
+            40.0
+        )
+
+        child.ignition_buffer = np.clip(
+            child.ignition_buffer,
+            100,
+            600
+        )
+
+        return child
+
+    # =====================================================
+    # HIERARCHICAL GUIDANCE
+    # =====================================================
+    def get_commands(
+        self,
+        noisy_pos,
+        noisy_vel,
+        mass,
+        wind_estimate
+    ):
+
+        x, y, z = noisy_pos
+        vx, vy, vz = noisy_vel
+
+        # =================================================
+        # PREDICTIVE IMPACT ESTIMATION
+        # =================================================
+        predicted_impact = estimate_impact_point(
+            noisy_pos,
+            noisy_vel
+        )
+
+        impact_x, impact_y = predicted_impact
+
+        # =================================================
+        # IGNITION LOGIC
+        # =================================================
+        max_a_z = (F_MAX / mass) - G
+
+        d_brake = (
+            vz**2 /
+            (2 * max_a_z * 0.75)
+        )
+
+        if not self.ignited:
+
+            if z <= d_brake + self.ignition_buffer:
+                self.ignited = True
+
+            return (
+                0.0,
+                -noisy_vel /
+                (np.linalg.norm(noisy_vel) + 1e-6)
+            )
+
+        # =================================================
+        # RL STRATEGIC DESCENT PLANNING
+        # =================================================
+        if z > 1200:
+
+            v_z_target = (
+                -70
+                * self.descent_aggression
+            )
+
+        elif z > 400:
+
+            v_z_target = (
+                -30
+                * self.descent_aggression
+            )
+
+        elif z > 80:
+
+            v_z_target = (
+                -8
+                * self.descent_aggression
+            )
+
+        else:
+
+            v_z_target = -1.0
+
+        # =================================================
+        # PREDICTIVE LATERAL GUIDANCE
+        # =================================================
+        pred_x_correction = (
+            -impact_x
+            * self.prediction_strength
+        )
+
+        pred_y_correction = (
+            -impact_y
+            * self.prediction_strength
+        )
+
+        # =================================================
+        # WIND COMPENSATION
+        # =================================================
+        wind_x, wind_y = wind_estimate[:2]
+
+        wind_corr_x = (
+            -wind_x
+            * self.wind_compensation
+        )
+
+        wind_corr_y = (
+            -wind_y
+            * self.wind_compensation
+        )
+
+        # =================================================
+        # LOW LEVEL MPC
+        # =================================================
+        az_req = (
+            self.kz *
+            (v_z_target - vz)
+            + G
+        )
+
+        ax_req = (
+
+            -self.kp_xy * x
+            -self.kd_xy * vx
+
+            + pred_x_correction
+            + wind_corr_x
+        )
+
+        ay_req = (
+
+            -self.kp_xy * y
+            -self.kd_xy * vy
+
+            + pred_y_correction
+            + wind_corr_y
+        )
+
+        total_f_req = np.array([
+            ax_req,
+            ay_req,
+            az_req
+        ]) * mass
+
+        # =================================================
+        # DYNAMIC TILT LIMITING
+        # =================================================
+        max_tilt = np.radians(
+            self.max_tilt_deg
+        )
+
+        f_mag = np.linalg.norm(total_f_req)
+
+        f_dir = (
+            total_f_req /
+            (f_mag + 1e-6)
+        )
+
+        tilt = np.arccos(
+            np.clip(f_dir[2], -1, 1)
+        )
+
+        if tilt > max_tilt:
+
+            scale = (
+                np.tan(max_tilt)
+                * total_f_req[2]
+                / (
+                    np.linalg.norm(
+                        total_f_req[:2]
+                    )
+                    + 1e-6
+                )
+            )
+
+            total_f_req[:2] *= scale
+
+        # =================================================
+        # FINAL THRUST
+        # =================================================
+        thrust_mag = np.clip(
+            np.linalg.norm(total_f_req),
+            F_MAX * MIN_THROTTLE,
+            F_MAX
+        )
+
+        thrust_dir = (
+            total_f_req /
+            (np.linalg.norm(total_f_req) + 1e-6)
+        )
+
+        return thrust_mag, thrust_dir
+
+# =========================================================
+# 8. SINGLE SIMULATION
+# =========================================================
+def run_single_sim(policy):
+
+    pos = np.array([
+        np.random.normal(500, 40),
+        np.random.normal(-300, 40),
+        np.random.normal(5000, 50)
+    ])
+
+    vel = np.array([
+        np.random.normal(-40, 6),
+        np.random.normal(20, 6),
+        np.random.normal(-150, 8)
+    ])
+
+    rocket_axis = np.array([0, 0, 1.0])
+
+    omega = np.zeros(3)
+
+    mass = DRY_MASS + FUEL_MASS
+
+    dt = 0.02
+
+    policy.ignited = False
+
+    total_reward = 0
+
+    history = []
+
+    max_tilt = 0
+
+    for i in range(50000):
+
+        if pos[2] <= 0:
+            break
+
+        # =================================================
+        # SENSOR NOISE
+        # =================================================
+        noisy_pos = (
+            pos
+            + np.random.normal(
+                0,
+                SENSOR_NOISE_STD,
+                3
+            )
+        )
+
+        noisy_vel = (
+            vel
+            + np.random.normal(
+                0,
+                SENSOR_NOISE_STD / 2,
+                3
+            )
+        )
+
+        # =================================================
+        # STOCHASTIC WINDS
+        # =================================================
+        wind_vec = np.array([
+
+            np.sin(i * 0.01)
+            * WIND_GUST_STRENGTH
+            * np.random.uniform(0.4, 1.8),
+
+            np.cos(i * 0.013)
+            * WIND_GUST_STRENGTH
+            * np.random.uniform(0.4, 1.8),
+
+            0
+        ])
+
+        relative_vel = vel - wind_vec
+
+        # =================================================
+        # GUIDANCE
+        # =================================================
+        T_mag, T_dir_target = (
+            policy.get_commands(
+                noisy_pos,
+                noisy_vel,
+                mass,
+                wind_vec
+            )
+        )
+
+        # =================================================
+        # ATMOSPHERE
+        # =================================================
+        rho = (
+            1.225
+            * np.exp(-pos[2] / 8500)
+        )
+
+        q = (
+            0.5
+            * rho
+            * np.linalg.norm(relative_vel)**2
+        )
+
+        inertia = get_inertia(mass)
+
+        # =================================================
+        # ATTITUDE CONTROL
+        # =================================================
+        attitude_error = np.cross(
+            rocket_axis,
+            T_dir_target
+        )
+
+        control_torque = (
+
+            policy.kp_att
+            * attitude_error
+
+            - policy.kd_att
+            * omega
+        )
+
+        aero_torque = (
+
+            np.cross(
+                rocket_axis,
+                -relative_vel /
+                (np.linalg.norm(relative_vel) + 1e-6)
+            )
+
+            * q
+            * AREA_FINS
+            * (HEIGHT / 2)
+            * 0.12
+        )
+
+        total_torque = (
+            control_torque
+            + aero_torque
+        )
+
+        alpha = total_torque / inertia
+
+        omega += alpha * dt
+
+        omega *= 0.92
+
+        MAX_OMEGA = np.radians(18)
+
+        omega_mag = np.linalg.norm(omega)
+
+        if omega_mag > MAX_OMEGA:
+
+            omega = (
+                omega /
+                omega_mag
+                * MAX_OMEGA
+            )
+
+        rocket_axis += (
+            np.cross(omega, rocket_axis)
+            * dt
+        )
+
+        rocket_axis /= (
+            np.linalg.norm(rocket_axis)
+            + 1e-6
+        )
+
+        # =================================================
+        # TILT
+        # =================================================
+        tilt_deg = np.degrees(
+            np.arccos(
+                np.clip(
+                    rocket_axis[2],
+                    -1,
+                    1
+                )
+            )
+        )
+
+        max_tilt = max(max_tilt, tilt_deg)
+
+        # =================================================
+        # FORCES
+        # =================================================
+        thrust_vec = rocket_axis * T_mag
+
+        drag_vec = (
+
+            -relative_vel
+
+            * (
+                0.5
+                * rho
+                * np.linalg.norm(relative_vel)
+                * AREA_SIDE
+                * 0.4
+            )
+        )
+
+        accel = (
+
+            thrust_vec
+            + drag_vec
+            + np.array([0, 0, -G * mass])
+
+        ) / mass
+
+        vel += accel * dt
+
+        pos += vel * dt
+
+        # =================================================
+        # FUEL
+        # =================================================
+        isp = (
+
+            ISP_VAC
+
+            - (
+                ISP_VAC - ISP_SEA
+            )
+
+            * np.exp(-pos[2] / 8500)
+        )
+
+        mass -= (
+            T_mag / (isp * G)
+        ) * dt
+
+        mass = max(mass, DRY_MASS)
+
+        history.append(pos.copy())
+
+        # =================================================
+        # DENSE REWARDS
+        # =================================================
+        impact_est = estimate_impact_point(
+            pos,
+            vel
+        )
+
+        impact_error = np.linalg.norm(
+            impact_est
+        )
+
+        lat_energy = lateral_energy(
+            mass,
+            vel[0],
+            vel[1]
+        )
+
+        timestep_reward = -(
+            0.00008 * impact_error**2
+            + 0.00002 * lat_energy
+            + 0.01 * tilt_deg**2
+            + 0.001 * vel[2]**2
+        )
+
+        total_reward += timestep_reward
+
+    # =====================================================
+    # TERMINAL REWARD
+    # =====================================================
+    final_speed = np.linalg.norm(vel)
+
+    landing_offset = np.linalg.norm(pos[:2])
+
+    fuel_used = (
+        DRY_MASS + FUEL_MASS - mass
+    )
+
+    terminal_reward = -(
+        1.0 * final_speed**2
+        + 0.08 * landing_offset**2
+        + 0.25 * max_tilt**2
+    )
+
+    total_reward += terminal_reward
+
+    success = (
+        final_speed < SAFE_SPEED
+        and landing_offset < SAFE_OFFSET
+        and max_tilt < SAFE_TILT
+    )
+
+    if success:
+        total_reward += 10000
+
+    return {
+        "reward": total_reward,
+        "speed": final_speed,
+        "offset": landing_offset,
+        "tilt": max_tilt,
+        "fuel": fuel_used,
+        "success": success,
+        "history": np.array(history)
+    }
+
+# =========================================================
+# 9. INITIAL POLICY
+# =========================================================
+base_policy = HierarchicalRLPolicy()
+
+elite_policies = [copy.deepcopy(base_policy)]
+
+global_best_reward = -np.inf
+
+reward_history = []
+
+best_run = None
+
+# =========================================================
+# 10. EVOLUTIONARY RL LOOP
+# =========================================================
+for generation in range(NUM_GENERATIONS):
+
+    print("\n" + "#" * 80)
+    print(f"GENERATION {generation+1}")
+    print("#" * 80)
+
+    policy_results = []
+
+    # =====================================================
+    # GENERATE POLICY POPULATION
+    # =====================================================
+    candidates = []
+
+    for elite in elite_policies:
+
+        candidates.append(elite)
+
+        for _ in range(
+            POLICIES_PER_GENERATION // ELITE_COUNT
+        ):
+
+            candidates.append(
+                elite.mutate()
+            )
+
+    # =====================================================
+    # EVALUATE POLICIES
+    # =====================================================
+    for idx, policy in enumerate(candidates):
+
+        rewards = []
+
+        speeds = []
+
+        offsets = []
+
+        fuels = []
+
+        successes = 0
+
+        best_local = None
+
+        best_local_reward = -np.inf
+
+        for trial in range(TRIALS_PER_POLICY):
+
+            result = run_single_sim(policy)
+
+            rewards.append(result["reward"])
+
+            speeds.append(result["speed"])
+
+            offsets.append(result["offset"])
+
+            fuels.append(result["fuel"])
+
+            if result["success"]:
+                successes += 1
+
+            if result["reward"] > best_local_reward:
+
+                best_local_reward = result["reward"]
+
+                best_local = result
+
+        mean_reward = np.mean(rewards)
+
+        mean_speed = np.mean(speeds)
+
+        mean_offset = np.mean(offsets)
+
+        mean_fuel = np.mean(fuels)
+
+        success_rate = (
+            successes
+            / TRIALS_PER_POLICY
+        ) * 100
+
+        print(
+            f"\nPolicy {idx+1}"
+        )
+
+        print(
+            f"Reward        : "
+            f"{mean_reward:.2f}"
+        )
+
+        print(
+            f"Mean Speed    : "
+            f"{mean_speed:.2f} m/s"
+        )
+
+        print(
+            f"Mean Offset   : "
+            f"{mean_offset:.2f} m"
+        )
+
+        print(
+            f"Mean Fuel     : "
+            f"{mean_fuel:.2f} kg"
+        )
+
+        print(
+            f"Success Rate  : "
+            f"{success_rate:.2f}%"
+        )
+
+        print(
+            f"Runs/Policy   : "
+            f"{TRIALS_PER_POLICY}"
+        )
+
+        policy_results.append({
+
+            "policy": copy.deepcopy(policy),
+
+            "reward": mean_reward,
+
+            "best_run": best_local
+        })
+
+    # =====================================================
+    # ELITE SELECTION
+    # =====================================================
+    policy_results = sorted(
+        policy_results,
+        key=lambda x: x["reward"],
+        reverse=True
+    )
+
+    elite_policies = [
+
+        p["policy"]
+
+        for p in policy_results[:ELITE_COUNT]
+    ]
+
+    generation_best = policy_results[0]
+
+    reward_history.append(
+        generation_best["reward"]
+    )
+
+    print("\n" + "=" * 80)
+
+    print(
+        f"BEST GENERATION REWARD: "
+        f"{generation_best['reward']:.2f}"
+    )
+
+    # =====================================================
+    # GLOBAL BEST
+    # =====================================================
+    if generation_best["reward"] > global_best_reward:
+
+        global_best_reward = (
+            generation_best["reward"]
+        )
+
+        best_run = (
+            generation_best["best_run"]
+        )
+
+        print(
+            "NEW GLOBAL BEST POLICY"
+        )
+
+# =========================================================
+# 11. FINAL RESULTS
+# =========================================================
+print("\n" + "#" * 80)
+print("FINAL RESULTS")
+print("#" * 80)
+
+print(
+    f"BEST REWARD: "
+    f"{global_best_reward:.2f}"
+)
+
+# =========================================================
+# 12. BEST TRAJECTORY
+# =========================================================
+history = best_run["history"]
+
+fig = plt.figure(figsize=(10, 8))
+
+ax = fig.add_subplot(
+    111,
+    projection='3d'
+)
+
+ax.plot(
+    history[:,0],
+    history[:,1],
+    history[:,2],
+    lw=2
+)
+
+ax.set_xlabel("X")
+ax.set_ylabel("Y")
+ax.set_zlabel("Altitude")
+
+ax.set_title(
+    "Hierarchical RL-MPC Trajectory"
+)
+
+plt.show()
+
+# =========================================================
+# 13. LEARNING CURVE
+# =========================================================
+plt.figure(figsize=(8,5))
+
+plt.plot(
+    reward_history,
+    marker='o'
+)
+
+plt.xlabel("Generation")
+
+plt.ylabel("Best Reward")
+
+plt.title(
+    "Hierarchical RL Learning Progress"
+)
+
+plt.grid(True)
+
+plt.show()
